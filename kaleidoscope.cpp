@@ -30,14 +30,11 @@ static int gettok() {
 
     // parsing identifier
     if (isalpha(lastChar)) {
-        IdentifierStr += lastChar;
+        IdentifierStr = lastChar;
         while (isalnum(lastChar = getchar())) IdentifierStr += lastChar;
 
-        if (IdentifierStr == "def") {
-           return tok_def;
-        } else if (IdentifierStr == "extern") {
-            return tok_extern;
-        }
+        if (IdentifierStr == "def") return tok_def;
+        if (IdentifierStr == "extern") return tok_extern;
         return tok_identifier;
     }
 
@@ -49,7 +46,7 @@ static int gettok() {
             lastChar = getchar();
         } while (isdigit(lastChar) || lastChar == '.');
 
-        NumVal = strtod(numRaw.c_str(), 0);
+        NumVal = strtod(numRaw.c_str(), nullptr);
         return tok_number;
     }
 
@@ -61,6 +58,8 @@ static int gettok() {
 
         if (lastChar != EOF) return gettok();
     }
+
+    if (lastChar == EOF) return tok_eof;
 
     int thisChar = lastChar;
     lastChar = getchar();
@@ -74,7 +73,7 @@ static int gettok() {
 
 class ExprAST {
 public:
-    virtual ~ExprAST();
+    virtual ~ExprAST() = default;
 };
 
 
