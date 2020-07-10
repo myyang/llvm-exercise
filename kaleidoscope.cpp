@@ -6,6 +6,20 @@
 #include <vector>
 #include <map>
 
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include <algorithm>
+
 /* =====
  * Lexer
  * =====
@@ -75,6 +89,7 @@ static int gettok() {
 class ExprAST {
 public:
     virtual ~ExprAST() = default;
+    virtual llvm::Value *codegen() = 0;
 };
 
 
@@ -83,6 +98,7 @@ class NumberExprAST: public ExprAST {
 
 public:
     NumberExprAST(double Val): val(Val) {};
+    llvm::Value *codegen() override;
 };
 
 class VariableExprAST: public ExprAST {
@@ -90,6 +106,7 @@ class VariableExprAST: public ExprAST {
 
 public:
     VariableExprAST(const std::string &Name): name(Name) {};
+    llvm::Value *codegen() override;
 };
 
 class BinaryExprAST: public ExprAST {
@@ -100,6 +117,7 @@ public:
     BinaryExprAST(char OP, std::unique_ptr<ExprAST> LHS,
             std::unique_ptr<ExprAST> RHS)
         : op(OP), lhs(std::move(LHS)), rhs(std::move(RHS)) {};
+    llvm::Value *codegen() override;
 };
 
 class CallExprAST: public ExprAST {
@@ -110,6 +128,7 @@ public:
     CallExprAST(const std::string &Callee,
             std::vector<std::unique_ptr<ExprAST>> Args)
     : callee(Callee), args(std::move(Args)) {}
+    llvm::Value *codegen() override;
 };
 
 class PrototypeAST {
@@ -119,6 +138,8 @@ class PrototypeAST {
 public:
     PrototypeAST(const std::string &Name, std::vector<std::string> Args)
         : name(Name), args(std::move(Args)) {};
+    llvm::Function *codegen();
+    const std::string &getName() const { return name; }
 };
 
 class FunctionAST {
@@ -128,6 +149,7 @@ class FunctionAST {
 public:
     FunctionAST(std::unique_ptr<PrototypeAST> Proto, std::unique_ptr<ExprAST> Body)
         : proto(std::move(Proto)), body(std::move(Body)) {};
+    llvm::Function *codegen();
 };
 
 /* =======
@@ -155,7 +177,7 @@ static std::unique_ptr<ExprAST> ParseExpression();
 
 // numberexpr ::= number
 static std::unique_ptr<ExprAST> ParseNumberExpr() {
-    auto result = std::unique_ptr<NumberExprAST>(new NumberExprAST(NumVal));
+    auto result = std::make_unique<NumberExprAST>(NumVal);
     getNextToken();
     return std::move(result);
 };
@@ -182,7 +204,7 @@ static std::unique_ptr<ExprAST> ParseIndentifierExpr() {
     getNextToken(); // eat identifier
 
     if (CurTok != '(')
-        return std::unique_ptr<VariableExprAST>(new VariableExprAST(idName));
+        return std::make_unique<VariableExprAST>(idName);
 
     getNextToken();  // eat (
     std::vector<std::unique_ptr<ExprAST>> args;
@@ -205,7 +227,7 @@ static std::unique_ptr<ExprAST> ParseIndentifierExpr() {
     // Eat the ')'.
     getNextToken();
 
-    return std::unique_ptr<CallExprAST>(new CallExprAST(idName, std::move(args)));
+    return std::make_unique<CallExprAST>(idName, std::move(args));
 }
 
 /// primary
@@ -252,12 +274,11 @@ static std::unique_ptr<ExprAST> ParseBinopRHS(int ExprPrec,
 
         int nextPrec = GetTokenPrecedence();
         if (tokPrec < nextPrec) {
-            rhs = ParseBinopRHS(nextPrec + 1, std::move(rhs));
+            rhs = ParseBinopRHS(tokPrec + 1, std::move(rhs));
             if (!rhs) return nullptr;
         }
 
-        LHS = std::unique_ptr<BinaryExprAST>(
-                new BinaryExprAST(BinOp, std::move(LHS), std::move(rhs)));
+        LHS = std::make_unique<BinaryExprAST>(BinOp, std::move(LHS), std::move(rhs));
     }
 }
 
@@ -266,6 +287,7 @@ static std::unique_ptr<ExprAST> ParseBinopRHS(int ExprPrec,
 static std::unique_ptr<ExprAST> ParseExpression() {
     auto lhs = ParsePrimary();
     if (!lhs) return nullptr;
+
     return ParseBinopRHS(0, std::move(lhs));
 }
 
@@ -289,8 +311,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
         return LogErrorP("Expected ')' in prototype");
     getNextToken();
 
-    return std::unique_ptr<PrototypeAST>(
-            new PrototypeAST(fnName, std::move(args)));
+    return std::make_unique<PrototypeAST>(fnName, std::move(args));
 }
 
 // definition ::= 'def' prototype expression
@@ -300,8 +321,7 @@ static std::unique_ptr<FunctionAST> ParseDefinition() {
     if (!proto) return nullptr;
 
     if (auto e = ParseExpression())
-        return std::unique_ptr<FunctionAST>(
-                new FunctionAST(std::move(proto), std::move(e)));
+        return std::make_unique<FunctionAST>(std::move(proto), std::move(e));
     return nullptr;
 }
 
@@ -316,10 +336,112 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
     if (auto e = ParseExpression()) {
         auto anonymous = std::unique_ptr<PrototypeAST>(
                 new PrototypeAST("_anonymous_", std::vector<std::string>()));
-        return std::unique_ptr<FunctionAST>(
-                new FunctionAST(std::move(anonymous), std::move(e)));
+        return std::make_unique<FunctionAST>(std::move(anonymous), std::move(e));
     }
     return nullptr;
+}
+
+/* =======
+ * codegen
+ * =======
+ */
+
+static llvm::LLVMContext TheContext;
+static llvm::IRBuilder<> Builder(TheContext);
+static std::unique_ptr<llvm::Module> TheModule;
+static std::map<std::string, llvm::Value *> NamedValues;
+
+llvm::Value *LogErrorV(const char *Str) {
+    LogError(Str);
+    return nullptr;
+}
+
+llvm::Value *NumberExprAST::codegen() {
+    return llvm::ConstantFP::get(TheContext, llvm::APFloat(val));
+}
+
+llvm::Value *VariableExprAST::codegen() {
+    llvm::Value *v = NamedValues[name];
+    if (!v) LogErrorV("Unknown variable name");
+    return v;
+}
+
+llvm::Value *BinaryExprAST::codegen() {
+    llvm::Value *L = lhs->codegen();
+    llvm::Value *R = rhs->codegen();
+    if (!L || !R) return nullptr;
+
+    switch (op) {
+    case '+':
+        return Builder.CreateFAdd(L, R, "addtmp");
+    case '-':
+        return Builder.CreateFSub(L, R, "subtmp");
+    case '*':
+        return Builder.CreateFMul(L, R, "multmp");
+    case '<':
+        L = Builder.CreateFCmpULT(L, R, "cmptmp");
+        return Builder.CreateUIToFP(L, llvm::Type::getDoubleTy(TheContext), "booltmp");
+    default:
+        return LogErrorV("invalid binary operate");
+    }
+}
+
+llvm::Value *CallExprAST::codegen() {
+    llvm::Function *CalleeF = TheModule->getFunction(callee);
+    if (!CalleeF) return nullptr;
+
+    if (CalleeF->arg_size() != args.size()) return LogErrorV("incorrect # args passwd");
+
+    std::vector<llvm::Value *> ArgsV;
+    for (unsigned i = 0, e = args.size(); i != e; ++i) {
+        ArgsV.emplace_back(args[i]->codegen());
+        if (!ArgsV.back()) return nullptr;
+    }
+
+    return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+llvm::Function *PrototypeAST::codegen() {
+    std::vector<llvm::Type *> Doubles(args.size(), llvm::Type::getDoubleTy(TheContext));
+
+    llvm::FunctionType *FT = llvm::FunctionType::get(
+            llvm::Type::getDoubleTy(TheContext), Doubles, false);
+    llvm::Function *F = llvm::Function::Create(
+            FT, llvm::Function::ExternalLinkage, name, TheModule.get());
+
+    unsigned idx = 0;
+    for (auto &arg : F->args()) arg.setName(args[idx++]);
+
+    return F;
+}
+
+llvm::Function *FunctionAST::codegen() {
+    llvm::Function *TheFunction = TheModule->getFunction(proto->getName());
+
+    if (!TheFunction) TheFunction = proto->codegen();
+
+    if (!TheFunction) return nullptr;
+
+    if (!TheFunction->empty()) return (llvm::Function *)LogErrorV("function can't be redefined");
+
+  // Create a new basic block to start insertion into.
+    llvm::BasicBlock *BB = llvm::BasicBlock::Create(TheContext, "entry", TheFunction);
+    Builder.SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+    NamedValues.clear();
+    for (auto &Arg : TheFunction->args())
+        NamedValues[Arg.getName()] = &Arg;
+
+    if (llvm::Value *RetVal = body->codegen()) {
+        Builder.CreateRet(RetVal);
+        llvm::verifyFunction(*TheFunction);
+        return TheFunction;
+    }
+
+    TheFunction->eraseFromParent();
+    return nullptr;
+
 }
 
 /* =================================
@@ -328,8 +450,12 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
  */
 
 static void HandleDefinition() {
-	if (ParseDefinition()) {
-		fprintf(stderr, "Parsed a function definition.\n");
+	if (auto FnAST = ParseDefinition()) {
+        if (auto *FnIR = FnAST->codegen()) {
+            fprintf(stderr, "Parsed a function definition:\n");
+            FnIR->print(llvm::errs());
+            fprintf(stderr, "\n");
+        }
 	} else {
 		// Skip token for error recovery.
 		getNextToken();
@@ -337,8 +463,12 @@ static void HandleDefinition() {
 }
 
 static void HandleExtern() {
-	if (ParseExtern()) {
-		fprintf(stderr, "Parsed an extern\n");
+	if (auto FnAST = ParseExtern()) {
+        if (auto *FnIR = FnAST->codegen()) {
+            fprintf(stderr, "Parsed an extern:\n");
+            FnIR->print(llvm::errs());
+            fprintf(stderr, "\n");
+        }
 	} else {
 		// Skip token for error recovery.
 		getNextToken();
@@ -347,8 +477,12 @@ static void HandleExtern() {
 
 static void HandleTopLevelExpression() {
 	// Evaluate a top-level expression into an anonymous function.
-	if (ParseTopLevelExpr()) {
-		fprintf(stderr, "Parsed a top-level expr\n");
+	if (auto FnAST = ParseTopLevelExpr()) {
+        if (auto *FnIR = FnAST->codegen()) {
+            fprintf(stderr, "Parsed a top-level expr\n");
+            FnIR->print(llvm::errs());
+            fprintf(stderr, "\n");
+        }
 	} else {
 		// Skip token for error recovery.
 		getNextToken();
@@ -388,7 +522,11 @@ int main() {
     fprintf(stderr, "ready> ");
     getNextToken();
 
+    TheModule = std::make_unique<llvm::Module>("my cool jit", TheContext);
+
     MainLoop();
+
+    TheModule->print(llvm::errs(), nullptr);
 
     return 0;
 }
