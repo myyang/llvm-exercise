@@ -18,4 +18,4 @@ CMDS = \
 	   toy
 
 toy:
-	$(AT_RUN) $(CXX) -g kaleidoscope.cpp $(LLVM_CONFIG_FLAGS) -o toy
+	$(AT_RUN) $(CXX) -g src/kaleidoscope.cpp $(LLVM_CONFIG_FLAGS) -o bin/toy
