@@ -20,6 +20,14 @@
 #include "llvm/IR/Function.h"
 #include <algorithm>
 
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Support/TargetSelect.h"
+
+#include "../include/KaleidoscopeJIT.h"
+
 /* =====
  * Lexer
  * =====
@@ -350,6 +358,9 @@ static llvm::LLVMContext TheContext;
 static llvm::IRBuilder<> Builder(TheContext);
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::Value *> NamedValues;
+static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
 llvm::Value *LogErrorV(const char *Str) {
     LogError(Str);
@@ -386,8 +397,19 @@ llvm::Value *BinaryExprAST::codegen() {
     }
 }
 
+llvm::Function *getFunction(std::string Name) {
+    if (auto *F = TheModule->getFunction(Name))
+        return F;
+
+    auto FI = FunctionProtos.find(Name);
+    if (FI != FunctionProtos.end())
+        return FI->second->codegen();
+
+    return nullptr;
+}
+
 llvm::Value *CallExprAST::codegen() {
-    llvm::Function *CalleeF = TheModule->getFunction(callee);
+    llvm::Function *CalleeF = getFunction(callee);
     if (!CalleeF) return nullptr;
 
     if (CalleeF->arg_size() != args.size()) return LogErrorV("incorrect # args passwd");
@@ -416,19 +438,22 @@ llvm::Function *PrototypeAST::codegen() {
 }
 
 llvm::Function *FunctionAST::codegen() {
-    llvm::Function *TheFunction = TheModule->getFunction(proto->getName());
+    auto &P = *proto;
+    FunctionProtos[proto->getName()] = std::move(proto);
+
+    llvm::Function *TheFunction = getFunction(P.getName());
 
     if (!TheFunction) TheFunction = proto->codegen();
 
     if (!TheFunction) return nullptr;
 
-    if (!TheFunction->empty()) return (llvm::Function *)LogErrorV("function can't be redefined");
+    //if (!TheFunction->empty()) return (llvm::Function *)LogErrorV("function can't be redefined");
 
-  // Create a new basic block to start insertion into.
+  	// Create a new basic block to start insertion into.
     llvm::BasicBlock *BB = llvm::BasicBlock::Create(TheContext, "entry", TheFunction);
     Builder.SetInsertPoint(BB);
 
-  // Record the function arguments in the NamedValues map.
+  	// Record the function arguments in the NamedValues map.
     NamedValues.clear();
     for (auto &Arg : TheFunction->args())
         NamedValues[Arg.getName()] = &Arg;
@@ -436,6 +461,7 @@ llvm::Function *FunctionAST::codegen() {
     if (llvm::Value *RetVal = body->codegen()) {
         Builder.CreateRet(RetVal);
         llvm::verifyFunction(*TheFunction);
+	    TheFPM->run(*TheFunction);
         return TheFunction;
     }
 
@@ -449,12 +475,26 @@ llvm::Function *FunctionAST::codegen() {
  * =================================
  */
 
+static void InitializeModuleAndPassManager() {
+    TheModule = std::make_unique<llvm::Module>("my cool jit", TheContext);
+    TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
+
+	TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+	TheFPM->add(llvm::createInstructionCombiningPass());
+	TheFPM->add(llvm::createReassociatePass());
+	TheFPM->add(llvm::createGVNPass());
+	TheFPM->add(llvm::createCFGSimplificationPass());
+	TheFPM->doInitialization();
+}
+
 static void HandleDefinition() {
 	if (auto FnAST = ParseDefinition()) {
         if (auto *FnIR = FnAST->codegen()) {
             fprintf(stderr, "Parsed a function definition:\n");
             FnIR->print(llvm::errs());
             fprintf(stderr, "\n");
+            TheJIT->addModule(std::move(TheModule));
+            InitializeModuleAndPassManager();
         }
 	} else {
 		// Skip token for error recovery.
@@ -468,6 +508,7 @@ static void HandleExtern() {
             fprintf(stderr, "Parsed an extern:\n");
             FnIR->print(llvm::errs());
             fprintf(stderr, "\n");
+            FunctionProtos[FnAST->getName()] = std::move(FnAST);
         }
 	} else {
 		// Skip token for error recovery.
@@ -482,6 +523,17 @@ static void HandleTopLevelExpression() {
             fprintf(stderr, "Parsed a top-level expr\n");
             FnIR->print(llvm::errs());
             fprintf(stderr, "\n");
+
+            auto H = TheJIT->addModule(std::move(TheModule));
+            InitializeModuleAndPassManager();
+
+            auto ExprSymbol = TheJIT->findSymbol("_anonymous_");
+            assert(ExprSymbol && "Function not found");
+
+            double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
+            fprintf(stderr, "Evaluated to %f\n", FP());
+
+            TheJIT->removeModule(H);
         }
 	} else {
 		// Skip token for error recovery.
@@ -513,6 +565,10 @@ static void MainLoop() {
 }
 
 int main() {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+	llvm::InitializeNativeTargetAsmParser();
+
     // init precedence;
     BinopPrecedence['<'] = 10;
     BinopPrecedence['+'] = 20;
@@ -522,7 +578,9 @@ int main() {
     fprintf(stderr, "ready> ");
     getNextToken();
 
-    TheModule = std::make_unique<llvm::Module>("my cool jit", TheContext);
+    TheJIT = std::make_unique<llvm::orc::KaleidoscopeJIT>();
+
+    InitializeModuleAndPassManager();
 
     MainLoop();
 
