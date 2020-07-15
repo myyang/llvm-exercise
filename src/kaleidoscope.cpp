@@ -43,6 +43,8 @@ enum Token {
     tok_if = -6,
     tok_then = -7,
     tok_else = -8,
+    tok_for = -9,
+    tok_in = -10,
 };
 
 // the parse result would be safe here through lexing.
@@ -64,6 +66,8 @@ static int gettok() {
         if (IdentifierStr == "if") return tok_if;
         if (IdentifierStr == "then") return tok_then;
         if (IdentifierStr == "else") return tok_else;
+        if (IdentifierStr == "for") return tok_for;
+        if (IdentifierStr == "in") return tok_in;
         return tok_identifier;
     }
 
@@ -154,6 +158,20 @@ public:
     : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
 
   llvm::Value *codegen() override;
+};
+
+class ForExprAST: public ExprAST {
+    std::string varName;
+    std::unique_ptr<ExprAST> start, end, step, body;
+
+public:
+    ForExprAST(const std::string &VarName, std::unique_ptr<ExprAST> Start,
+             std::unique_ptr<ExprAST> End, std::unique_ptr<ExprAST> Step,
+             std::unique_ptr<ExprAST> Body)
+        : varName(VarName), start(std::move(Start)), end(std::move(End)),
+        step(std::move(Step)), body(std::move(Body)) {}
+
+    llvm::Value *codegen() override;
 };
 
 class PrototypeAST {
@@ -282,11 +300,55 @@ static std::unique_ptr<ExprAST> ParseIfExpr() {
     return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then), std::move(Else));
 }
 
+// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
+static std::unique_ptr<ExprAST> ParseForExpr() {
+    getNextToken();
+
+    if (CurTok != tok_identifier)
+        return LogError("expected identifier after for");
+
+    std::string IDName = IdentifierStr;
+    getNextToken();
+
+    if (CurTok != '=')
+        return LogError("expected '=' after for");
+    getNextToken();
+
+    auto Start = ParseExpression();
+    if (!Start) return nullptr;
+    if (CurTok != ',')
+        return LogError("expected ',' after for start value");
+    getNextToken();
+
+    auto End = ParseExpression();
+    if (!End) return nullptr;
+
+    std::unique_ptr<ExprAST> Step;
+    if (CurTok == ',') {
+        getNextToken();
+        Step = ParseExpression();
+        if (!Step)
+            return nullptr;
+    }
+
+    if (CurTok != tok_in)
+        return LogError("expected in after for");
+    getNextToken();
+
+    auto Body = ParseExpression();
+    if (!Body) return nullptr;
+
+    return std::make_unique<ForExprAST>(
+            IDName, std::move(Start), std::move(End),
+            std::move(Step), std::move(Body));
+}
+
 /// primary
 ///   ::= identifierexpr
 ///   ::= numberexpr
 ///   ::= parenexpr
 ///   ::= ifexpr
+///   ::= forexpr
 static std::unique_ptr<ExprAST> ParsePrimary() {
     switch (CurTok) {
     case tok_identifier:
@@ -297,8 +359,10 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
         return ParseParenExpr();
     case tok_if:
         return ParseIfExpr();
+    case tok_for:
+        return ParseForExpr();
     default:
-        return LogError("Unkonw token when expecting a expressions");
+        return LogError("Unknown token when expecting an expression");
     }
 }
 
@@ -508,6 +572,76 @@ llvm::Value *IfExprAST::codegen() {
     PN->addIncoming(ElseV, ElseBB);
 
     return PN;
+}
+
+// Output for-loop as:
+//   ...
+//   start = startexpr
+//   goto loop
+// loop:
+//   variable = phi [start, loopheader], [nextvariable, loopend]
+//   ...
+//   bodyexpr
+//   ...
+// loopend:
+//   step = stepexpr
+//   nextvariable = variable + step
+//   endcond = endexpr
+//   br endcond, loop, endloop
+// outloop:
+llvm::Value *ForExprAST::codegen() {
+    llvm::Value *StartVal = start->codegen();
+    if (!StartVal) return nullptr;
+
+    llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
+    llvm::BasicBlock *PreHeaderBB = Builder.GetInsertBlock();
+    llvm::BasicBlock *LoopBB = llvm::BasicBlock::Create(TheContext, "loop", TheFunction);
+
+    Builder.CreateBr(LoopBB);
+
+    Builder.SetInsertPoint(LoopBB);
+
+    llvm::PHINode *Var =
+        Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext), 2, varName);
+    Var->addIncoming(StartVal, PreHeaderBB);
+
+    llvm::Value *OldVal = NamedValues[varName];
+    NamedValues[varName] = Var;
+
+    if (!body->codegen()) return nullptr;
+
+    llvm::Value *StepVal = nullptr;
+    if (step) {
+        StepVal = step->codegen();
+        if (!StepVal) return nullptr;
+    } else {
+        StepVal =
+            llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0));
+    }
+
+    llvm::Value *NextVal = Builder.CreateFAdd(Var, StepVal, "nextvar");
+
+    llvm::Value *EndCond = end->codegen();
+    if (!EndCond) return nullptr;
+
+    EndCond = Builder.CreateFCmpONE(
+            EndCond, llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0)), "loopcond");
+
+    llvm::BasicBlock *LoopEndBB = Builder.GetInsertBlock();
+    llvm::BasicBlock *AfterBB =
+        llvm::BasicBlock::Create(TheContext, "afterloop", TheFunction);
+
+    Builder.CreateCondBr(EndCond, LoopBB, AfterBB);
+
+    Builder.SetInsertPoint(AfterBB);
+
+    Var->addIncoming(NextVal, LoopEndBB);
+
+    if (OldVal) NamedValues[varName] = OldVal;
+    else NamedValues.erase(varName);
+
+    return llvm::Constant::getNullValue(
+            llvm::Type::getDoubleTy(TheContext));
 }
 
 llvm::Function *PrototypeAST::codegen() {
