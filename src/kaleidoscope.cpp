@@ -802,7 +802,7 @@ llvm::Value *ForExprAST::codegen() {
     Builder.CreateStore(NextVal, Alloca);
 
     EndCond = Builder.CreateFCmpONE(
-            EndCond, llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0)), "loopcond");
+            EndCond, llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0)), "loopcond");
 
     llvm::BasicBlock *AfterBB =
         llvm::BasicBlock::Create(TheContext, "afterloop", TheFunction);
