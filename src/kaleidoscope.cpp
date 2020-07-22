@@ -49,6 +49,7 @@ enum Token {
     tok_in = -10,
     tok_binary = -11,
     tok_unary = -12,
+    tok_var = -13,
 };
 
 // the parse result would be safe here through lexing.
@@ -74,6 +75,7 @@ static int gettok() {
         if (IdentifierStr == "in") return tok_in;
         if (IdentifierStr == "binary") return tok_binary;
         if (IdentifierStr == "unary") return tok_unary;
+        if (IdentifierStr == "var") return tok_var;
         return tok_identifier;
     }
 
@@ -189,6 +191,18 @@ class UnaryExprAST: public ExprAST {
 public:
     UnaryExprAST(char Op, std::unique_ptr<ExprAST> Operand)
         : op(Op), operand(std::move(Operand)) {}
+
+    llvm::Value *codegen() override;
+};
+
+class VarExprAST: public ExprAST {
+    std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> varNames;
+    std::unique_ptr<ExprAST> body;
+
+public:
+    VarExprAST(std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames,
+            std::unique_ptr<ExprAST> Body)
+        : varNames(std::move(VarNames)), body(std::move(Body)) {}
 
     llvm::Value *codegen() override;
 };
@@ -378,6 +392,45 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
             std::move(Step), std::move(Body));
 }
 
+static std::unique_ptr<ExprAST> ParseVarExpr() {
+    getNextToken();
+
+    std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+
+    if (CurTok != tok_identifier)
+        return LogError("expected identifier after var");
+
+    while (1) {
+        std::string Name = IdentifierStr;
+        getNextToken(); // eat identifier
+
+        std::unique_ptr<ExprAST> Init;
+        if (CurTok == '=') {
+            getNextToken(); // eat '='
+
+            Init = ParseExpression();
+            if (!Init) return nullptr;
+        }
+
+        VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+        if (CurTok != ',') break;
+        getNextToken(); // eat ','
+
+        if (CurTok != tok_identifier)
+            return LogError("expected identifier list after var");
+    }
+
+    if (CurTok != tok_in)
+        return LogError("expected 'in' keyword after 'var'");
+
+    getNextToken();
+    auto Body = ParseExpression();
+    if (!Body) return nullptr;
+
+    return std::make_unique<VarExprAST>(std::move(VarNames), std::move(Body));
+}
+
 /// primary
 ///   ::= identifierexpr
 ///   ::= numberexpr
@@ -396,6 +449,8 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
         return ParseIfExpr();
     case tok_for:
         return ParseForExpr();
+    case tok_var:
+        return ParseVarExpr();
     default:
         return LogError("Unknown token when expecting an expression");
     }
@@ -775,6 +830,45 @@ llvm::Value *UnaryExprAST::codegen() {
         return LogErrorV("Unknown unary operator");
     }
     return Builder.CreateCall(F, OperandV, "unop");
+}
+
+llvm::Value *VarExprAST::codegen() {
+    std::vector<llvm::AllocaInst *> OldBindings;
+
+    llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
+
+    for (unsigned i = 0, e = varNames.size(); i != e; ++i)  {
+        const std::string &VarName = varNames[i].first;
+        ExprAST *Init = varNames[i].second.get();
+        // Emit the initializer before adding the variable to scope, this prevents
+        //  the initializer from referencing the variable itself, and permits stuff
+        //  like this:
+        //      var a = 1 in
+        //          var a = a in ...   # refers to outer 'a'.
+        llvm::Value *InitVal;
+        if (Init) {
+            InitVal = Init->codegen();
+            if (!InitVal)
+                return nullptr;
+        } else {
+            InitVal = llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0));
+        }
+
+        llvm::AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+        Builder.CreateStore(InitVal, Alloca);
+
+        OldBindings.push_back(NamedValues[VarName]);
+
+        NamedValues[VarName] = Alloca;
+    }
+
+    llvm::Value *BodyVal = body->codegen();
+    if (!BodyVal) return nullptr;
+
+    for (unsigned i = 0, e = varNames.size(); i != e; ++i)
+        NamedValues[varNames[i].first] = OldBindings[i];
+
+    return BodyVal;
 }
 
 llvm::Function *PrototypeAST::codegen() {
