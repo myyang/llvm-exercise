@@ -21,10 +21,12 @@
 #include <algorithm>
 
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
-#include "llvm/Support/TargetSelect.h"
+#include "llvm/Transforms/Utils.h"
 
 #include "../include/KaleidoscopeJIT.h"
 
@@ -129,6 +131,8 @@ class VariableExprAST: public ExprAST {
 public:
     VariableExprAST(const std::string &Name): name(Name) {};
     llvm::Value *codegen() override;
+
+    const std::string &getName() const { return name; }
 };
 
 class BinaryExprAST: public ExprAST {
@@ -554,7 +558,7 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 static llvm::LLVMContext TheContext;
 static llvm::IRBuilder<> Builder(TheContext);
 static std::unique_ptr<llvm::Module> TheModule;
-static std::map<std::string, llvm::Value *> NamedValues;
+static std::map<std::string, llvm::AllocaInst *> NamedValues;
 static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
 static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
@@ -571,7 +575,8 @@ llvm::Value *NumberExprAST::codegen() {
 llvm::Value *VariableExprAST::codegen() {
     llvm::Value *v = NamedValues[name];
     if (!v) LogErrorV("Unknown variable name");
-    return v;
+
+    return Builder.CreateLoad(v, name.c_str());
 }
 
 llvm::Function *getFunction(std::string Name) {
@@ -585,7 +590,29 @@ llvm::Function *getFunction(std::string Name) {
     return nullptr;
 }
 
+static llvm::AllocaInst* CreateEntryBlockAlloca(
+        llvm::Function *TheFunction, const std::string &VarName) {
+    llvm::IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
+            TheFunction->getEntryBlock().begin());
+    return TmpB.CreateAlloca(llvm::Type::getDoubleTy(TheContext), 0, VarName.c_str());
+}
+
+
 llvm::Value *BinaryExprAST::codegen() {
+    if (op == '=') {
+        VariableExprAST *LHSE = dynamic_cast<VariableExprAST*>(lhs.get());
+        if (!LHSE) return LogErrorV("destination of '=' must be a variable");
+
+        llvm::Value *Val = rhs->codegen();
+        if (!Val) return nullptr;
+
+        llvm::Value *Variable = NamedValues[LHSE->getName()];
+        if (!Variable) return LogErrorV("Unknow variable name");
+
+        Builder.CreateStore(Val, Variable);
+        return Val;
+    }
+
     llvm::Value *L = lhs->codegen();
     llvm::Value *R = rhs->codegen();
     if (!L || !R) return nullptr;
@@ -688,20 +715,19 @@ llvm::Value *ForExprAST::codegen() {
     if (!StartVal) return nullptr;
 
     llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
-    llvm::BasicBlock *PreHeaderBB = Builder.GetInsertBlock();
+
+    llvm::AllocaInst* Alloca = CreateEntryBlockAlloca(TheFunction, varName);
+
+    Builder.CreateStore(StartVal, Alloca);
+
     llvm::BasicBlock *LoopBB = llvm::BasicBlock::Create(TheContext, "loop", TheFunction);
 
     Builder.CreateBr(LoopBB);
 
     Builder.SetInsertPoint(LoopBB);
 
-    llvm::PHINode *Var =
-        Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext), 2, varName);
-    Var->addIncoming(StartVal, PreHeaderBB);
-
-    llvm::Value *OldVal = NamedValues[varName];
-    NamedValues[varName] = Var;
-
+    llvm::AllocaInst *OldVal = NamedValues[varName];
+    NamedValues[varName] = Alloca;
     if (!body->codegen()) return nullptr;
 
     llvm::Value *StepVal = nullptr;
@@ -713,23 +739,22 @@ llvm::Value *ForExprAST::codegen() {
             llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0));
     }
 
-    llvm::Value *NextVal = Builder.CreateFAdd(Var, StepVal, "nextvar");
-
     llvm::Value *EndCond = end->codegen();
     if (!EndCond) return nullptr;
+
+    llvm::Value *CurVal = Builder.CreateLoad(Alloca);
+    llvm::Value *NextVal = Builder.CreateFAdd(CurVal, StepVal, "nextvar");
+    Builder.CreateStore(NextVal, Alloca);
 
     EndCond = Builder.CreateFCmpONE(
             EndCond, llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0)), "loopcond");
 
-    llvm::BasicBlock *LoopEndBB = Builder.GetInsertBlock();
     llvm::BasicBlock *AfterBB =
         llvm::BasicBlock::Create(TheContext, "afterloop", TheFunction);
 
     Builder.CreateCondBr(EndCond, LoopBB, AfterBB);
 
     Builder.SetInsertPoint(AfterBB);
-
-    Var->addIncoming(NextVal, LoopEndBB);
 
     if (OldVal) NamedValues[varName] = OldVal;
     else NamedValues.erase(varName);
@@ -781,8 +806,11 @@ llvm::Function *FunctionAST::codegen() {
 
   	// Record the function arguments in the NamedValues map.
     NamedValues.clear();
-    for (auto &Arg : TheFunction->args())
-        NamedValues[Arg.getName()] = &Arg;
+    for (auto &Arg : TheFunction->args()) {
+        llvm::AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, Arg.getName());
+        Builder.CreateStore(&Arg, Alloca);
+        NamedValues[Arg.getName()] = Alloca;
+    }
 
     if (llvm::Value *RetVal = body->codegen()) {
         Builder.CreateRet(RetVal);
@@ -805,12 +833,13 @@ static void InitializeModuleAndPassManager() {
     TheModule = std::make_unique<llvm::Module>("my cool jit", TheContext);
     TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 
-	TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
-	TheFPM->add(llvm::createInstructionCombiningPass());
-	TheFPM->add(llvm::createReassociatePass());
-	TheFPM->add(llvm::createGVNPass());
-	TheFPM->add(llvm::createCFGSimplificationPass());
-	TheFPM->doInitialization();
+    TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+    TheFPM->add(llvm::createPromoteMemoryToRegisterPass());
+    TheFPM->add(llvm::createInstructionCombiningPass());
+    TheFPM->add(llvm::createReassociatePass());
+    TheFPM->add(llvm::createGVNPass());
+    TheFPM->add(llvm::createCFGSimplificationPass());
+    TheFPM->doInitialization();
 }
 
 static void HandleDefinition() {
@@ -923,6 +952,7 @@ int main() {
 	llvm::InitializeNativeTargetAsmParser();
 
     // init precedence;
+    BinopPrecedence['='] = 2;
     BinopPrecedence['<'] = 10;
     BinopPrecedence['+'] = 20;
     BinopPrecedence['-'] = 20;
