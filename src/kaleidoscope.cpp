@@ -483,6 +483,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
         getNextToken();
         break;
     case tok_binary:
+        getNextToken();
         if (!isascii(CurTok))
             return LogErrorP("Expected binary operator");
 
@@ -600,7 +601,7 @@ llvm::Value *BinaryExprAST::codegen() {
         L = Builder.CreateFCmpULT(L, R, "cmptmp");
         return Builder.CreateUIToFP(L, llvm::Type::getDoubleTy(TheContext), "booltmp");
     default:
-        return LogErrorV("invalid binary operate");
+        break;
     }
 
     std::string fnName = "binary";
