@@ -30,8 +30,8 @@
 *.exe
 *.out
 *.app
-bin/sample*
-bin/toy*
+kaleidoscope/bin/sample*
+kaleidoscope/bin/toy*
 
 # 3rd party includes
-include/llvm*
+kaleidoscope/include/llvm*

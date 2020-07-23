@@ -1,1 +1,2 @@
-LLVM Kaleidoscope practice
+LLVM exercises
+===============
